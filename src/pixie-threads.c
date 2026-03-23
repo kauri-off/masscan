@@ -48,7 +48,9 @@ DWORD_PTR result;
     max_prio_for_policy = sched_get_priority_max(policy);
 
 
-    pthread_setschedprio(thread, max_prio_for_policy);
+    struct sched_param sp = {0};
+    sp.sched_priority = max_prio_for_policy;
+    pthread_setschedparam(thread, policy, &sp);
     pthread_attr_destroy(&thAttr);
     return;
 
