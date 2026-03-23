@@ -1123,6 +1123,12 @@ _template_init_ipv6(struct TemplatePacket *tmpl, macaddress_t router_mac_ipv6, u
         memset(&tmpl->ipv6, 0, sizeof(tmpl->ipv6));
     }
 
+    /* By the time this function is called, the DATALINK KLUDGE in
+     * _template_init has already stripped LINUX_SLL down to raw IP,
+     * so parse it the same way as DLT_RAW. */
+    if (data_link_type == PCAP_DLT_LINUX_SLL)
+        data_link_type = PCAP_DLT_RAW;
+
     /* Parse the existing IPv4 packet */
     x = preprocess_frame(tmpl->ipv4.packet, tmpl->ipv4.length, data_link_type, &parsed);
     if (!x || parsed.found == FOUND_NOTHING) {
@@ -1161,6 +1167,7 @@ _template_init_ipv6(struct TemplatePacket *tmpl, macaddress_t router_mac_ipv6, u
             *(int*)buf = AF_INET6;
             break;
 	case PCAP_DLT_RAW: /* Raw (nothing before IP header) */
+	case PCAP_DLT_LINUX_SLL: /* Linux cooked socket (e.g. rmnet) */
 	    break;
         case PCAP_DLT_ETHERNET: /* Ethernet */
             /* Reset the destination MAC address to be the IPv6 router
@@ -1349,7 +1356,8 @@ _template_init(
                 tmpl->ipv4.length);
         tmpl->ipv4.offset_ip = 4;
         memcpy(tmpl->ipv4.packet, &linkproto, sizeof(int));
-    } else if (data_link_type == PCAP_DLT_RAW /* Raw IP */) {
+    } else if (data_link_type == PCAP_DLT_RAW /* Raw IP */
+            || data_link_type == PCAP_DLT_LINUX_SLL /* Linux cooked, e.g. rmnet */) {
         tmpl->ipv4.length -= tmpl->ipv4.offset_ip;
         tmpl->ipv4.offset_tcp -= tmpl->ipv4.offset_ip;
         tmpl->ipv4.offset_app -= tmpl->ipv4.offset_ip;

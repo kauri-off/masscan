@@ -580,9 +580,10 @@ parse_linux_sll:
         sll.addr_length = ex16be(px+offset+4);
         memcpy(sll.mac_address, px+offset+6, 8);
         sll.ethertype = ex16be(px+offset+14);
-   
+        ethertype = sll.ethertype;
+
         offset += 16;
-        
+
         goto parse_ethertype;
     }
     

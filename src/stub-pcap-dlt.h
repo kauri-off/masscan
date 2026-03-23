@@ -13,6 +13,10 @@ typedef enum {
 	/* Packets are 'raw' on the network. The first byte
 	 * will be the first byte of the IPv4/IPv6 header */
 	PCAP_DLT_RAW = 12,
+
+	/* Linux "cooked" capture encapsulation, used when libpcap falls back
+	 * for interfaces without a supported link-layer type (e.g. rmnet) */
+	PCAP_DLT_LINUX_SLL = 113,
 } pcap_dlt_t;
 
 #endif

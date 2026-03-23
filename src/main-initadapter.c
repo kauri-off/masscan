@@ -89,7 +89,8 @@ masscan_initialize_adapter(
      */
     if (masscan->nic[index].link_type == PCAP_DLT_NULL) {
         LOG(1, "[+] source-mac = %s\n", "none");
-    } else if (masscan->nic[index].link_type == PCAP_DLT_RAW) {
+    } else if (masscan->nic[index].link_type == PCAP_DLT_RAW
+            || masscan->nic[index].link_type == PCAP_DLT_LINUX_SLL) {
         LOG(1, "[+] source-mac = %s\n", "none");
     } else {
         *source_mac = masscan->nic[index].source_mac;
@@ -164,8 +165,9 @@ masscan_initialize_adapter(
         } else if (masscan->nic[index].link_type == PCAP_DLT_NULL) {
             /* If it's a VPN tunnel, then there is no Ethernet MAC address */
             LOG(1, "[+] router-mac-ipv4 = %s\n", "implicit");
-	} else if (masscan->nic[index].link_type == PCAP_DLT_RAW) {
-            /* If it's a VPN tunnel, then there is no Ethernet MAC address */
+	} else if (masscan->nic[index].link_type == PCAP_DLT_RAW
+                || masscan->nic[index].link_type == PCAP_DLT_LINUX_SLL) {
+            /* No Ethernet layer (raw IP or Linux cooked socket e.g. rmnet) */
             LOG(1, "[+] router-mac-ipv4 = %s\n", "implicit");
         } else if (macaddress_is_zero(*router_mac_ipv4)) {
             ipv4address_t router_ipv4 = masscan->nic[index].router_ip;

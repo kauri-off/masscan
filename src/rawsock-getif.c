@@ -254,8 +254,10 @@ static int parseRoutes(struct nlmsghdr *nlHdr, struct route_info *rtInfo)
     if (rtMsg->rtm_family != AF_INET)
         return 1;
 
-    /* This must be in main routing table */
-    if (rtMsg->rtm_table != RT_TABLE_MAIN)
+    /* Skip the local table (loopback/broadcast addresses) but accept the
+     * main table and any custom per-interface tables (e.g. Android uses
+     * table 1000, 1002, etc. for rmnet interfaces instead of RT_TABLE_MAIN). */
+    if (rtMsg->rtm_table == RT_TABLE_LOCAL)
         return 1;
 
     /* Attributes field*/
@@ -298,94 +300,142 @@ static int parseRoutes(struct nlmsghdr *nlHdr, struct route_info *rtInfo)
 int rawsock_get_default_interface(char *ifname, size_t sizeof_ifname)
 {
     int fd;
-    struct nlmsghdr *nlMsg;
-    char msgBuf[16384];
-    int len;
-    int msgSeq = 0;
-    unsigned ipv4 = 0;
-    int priority = 0x7FFFFF;
-
+    int seq = (int)time(0);
 
     /*
-     * Create 'netlink' socket to query kernel
+     * PRIMARY METHOD: targeted RTM_GETROUTE lookup.
+     *
+     * Ask the kernel which interface it would use to reach a well-known
+     * internet address (1.1.1.1).  This respects all policy routing rules,
+     * which is critical on Android where rmnet interfaces live in
+     * per-interface routing tables rather than RT_TABLE_MAIN.
      */
-    fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
-    if (fd < 0) {
-        fprintf(stderr, "%s:%d: socket(NETLINK_ROUTE): %d\n",
-            __FILE__, __LINE__, errno);
-        return errno;
+    {
+        /* Message layout: nlmsghdr | rtmsg | rtattr | uint32 dst */
+        struct {
+            struct nlmsghdr hdr;
+            struct rtmsg    rtm;
+            struct rtattr   rta;
+            uint32_t        dst;
+        } req;
+        unsigned char resp[4096];
+        ssize_t len;
+        struct nlmsghdr *nlHdr;
+
+        fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+        if (fd >= 0) {
+            memset(&req, 0, sizeof(req));
+            req.rtm.rtm_family  = AF_INET;
+            req.rtm.rtm_dst_len = 32;
+            req.rta.rta_type    = RTA_DST;
+            req.rta.rta_len     = RTA_LENGTH(sizeof(uint32_t));
+            req.dst             = htonl(0x01010101u); /* 1.1.1.1 */
+            req.hdr.nlmsg_type  = RTM_GETROUTE;
+            req.hdr.nlmsg_flags = NLM_F_REQUEST;
+            req.hdr.nlmsg_seq   = seq;
+            req.hdr.nlmsg_pid   = getpid();
+            req.hdr.nlmsg_len   = (uint32_t)sizeof(req);
+
+            if (send(fd, &req, sizeof(req), 0) >= 0) {
+                len = recv(fd, resp, sizeof(resp), 0);
+                nlHdr = (struct nlmsghdr *)resp;
+                if (len > 0
+                        && NLMSG_OK(nlHdr, (unsigned)len)
+                        && nlHdr->nlmsg_type != NLMSG_ERROR) {
+                    struct rtmsg  *rtMsg  = (struct rtmsg *)NLMSG_DATA(nlHdr);
+                    struct rtattr *rtAttr = (struct rtattr *)RTM_RTA(rtMsg);
+                    int            rtLen  = (int)RTM_PAYLOAD(nlHdr);
+
+                    for (; RTA_OK(rtAttr, rtLen);
+                             rtAttr = RTA_NEXT(rtAttr, rtLen)) {
+                        if (rtAttr->rta_type == RTA_OIF) {
+                            int idx = *(int *)RTA_DATA(rtAttr);
+                            if (if_indextoname(idx, ifname) != NULL) {
+                                LOG(3, "[+] getif: targeted lookup -> %s\n",
+                                        ifname);
+                                close(fd);
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+            close(fd);
+        }
     }
 
     /*
-     * format the netlink buffer
+     * FALLBACK: dump all routes and pick the best default.
+     *
+     * Used when the targeted lookup is unsupported or returns no OIF.
      */
-    memset(msgBuf, 0, sizeof(msgBuf));
-    nlMsg = (struct nlmsghdr *)msgBuf;
+    {
+        struct nlmsghdr *nlMsg;
+        char msgBuf[16384];
+        int len;
+        int msgSeq = 0;
+        unsigned ipv4 = 0;
+        int priority = 0x7FFFFF;
 
-    nlMsg->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
-    nlMsg->nlmsg_type = RTM_GETROUTE;
-    nlMsg->nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST;
-    nlMsg->nlmsg_seq = msgSeq++;
-    nlMsg->nlmsg_pid = getpid();
-
-    /*
-     * send first request to kernel
-     */
-    if (send(fd, nlMsg, nlMsg->nlmsg_len, 0) < 0) {
-        fprintf(stderr, "%s:%d: send(NETLINK_ROUTE): %d\n",
-            __FILE__, __LINE__, errno);
-        return errno;
-    }
-
-    /*
-     * Now read all the responses
-     */
-    len = read_netlink(fd, msgBuf, sizeof(msgBuf), msgSeq, getpid());
-    if (len <= 0) {
-        fprintf(stderr, "%s:%d: read_netlink: %d\n",
-            __FILE__, __LINE__, errno);
-        return errno;
-    }
-
-
-    /*
-     * Parse the response
-     */
-    for (; NLMSG_OK(nlMsg, len); nlMsg = NLMSG_NEXT(nlMsg, len)) {
-        struct route_info rtInfo[1];
-        int err;
-
-        memset(rtInfo, 0, sizeof(struct route_info));
-
-        //LOG(3, "if: nlmsg_type=%d nlmsg_flags=0x%x\n", nlMsg->nlmsg_type, nlMsg->nlmsg_flags);
-        err = parseRoutes(nlMsg, rtInfo);
-        if (err != 0)
-            continue;
-
-        LOG(3, "if: route: '%12s' dst=%u.%u.%u.%u src=%u.%u.%u.%u gw=%u.%u.%u.%u priority=%d\n",
-                rtInfo->ifName,
-                FORMATADDR(rtInfo->dstAddr.s_addr),
-                FORMATADDR(rtInfo->srcAddr.s_addr),
-                FORMATADDR(rtInfo->gateWay.s_addr),
-                rtInfo->priority
-            );
-
-        /* make sure destination = 0.0.0.0 for "default route" */
-        if (rtInfo->dstAddr.s_addr != 0)
-            continue;
-
-        /* found the gateway! */
-        if (rtInfo->priority < priority) {
-            priority = rtInfo->priority;
-            ipv4 = ntohl(rtInfo->gateWay.s_addr);
-            if (ipv4 == 0)
-                continue;
-            safe_strcpy(ifname, sizeof_ifname, rtInfo->ifName);
+        fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+        if (fd < 0) {
+            fprintf(stderr, "%s:%d: socket(NETLINK_ROUTE): %d\n",
+                __FILE__, __LINE__, errno);
+            return errno;
         }
 
-    }
+        memset(msgBuf, 0, sizeof(msgBuf));
+        nlMsg = (struct nlmsghdr *)msgBuf;
+        nlMsg->nlmsg_len   = NLMSG_LENGTH(sizeof(struct rtmsg));
+        nlMsg->nlmsg_type  = RTM_GETROUTE;
+        nlMsg->nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST;
+        nlMsg->nlmsg_seq   = msgSeq++;
+        nlMsg->nlmsg_pid   = getpid();
 
-    close(fd);
+        if (send(fd, nlMsg, nlMsg->nlmsg_len, 0) < 0) {
+            fprintf(stderr, "%s:%d: send(NETLINK_ROUTE): %d\n",
+                __FILE__, __LINE__, errno);
+            close(fd);
+            return errno;
+        }
+
+        len = read_netlink(fd, msgBuf, sizeof(msgBuf), msgSeq, getpid());
+        close(fd);
+        if (len <= 0)
+            return errno;
+
+        for (; NLMSG_OK(nlMsg, len); nlMsg = NLMSG_NEXT(nlMsg, len)) {
+            struct route_info rtInfo[1];
+            int err;
+
+            memset(rtInfo, 0, sizeof(struct route_info));
+            err = parseRoutes(nlMsg, rtInfo);
+            if (err != 0)
+                continue;
+
+            LOG(3, "if: route: '%12s' dst=%u.%u.%u.%u src=%u.%u.%u.%u"
+                    " gw=%u.%u.%u.%u priority=%d\n",
+                    rtInfo->ifName,
+                    FORMATADDR(rtInfo->dstAddr.s_addr),
+                    FORMATADDR(rtInfo->srcAddr.s_addr),
+                    FORMATADDR(rtInfo->gateWay.s_addr),
+                    rtInfo->priority);
+
+            if (rtInfo->dstAddr.s_addr != 0)
+                continue;
+
+            if (rtInfo->priority < priority) {
+                priority = rtInfo->priority;
+                ipv4 = ntohl(rtInfo->gateWay.s_addr);
+                if (ipv4 == 0) {
+                    ipv4 = ntohl(rtInfo->srcAddr.s_addr);
+                    if (ipv4 == 0)
+                        continue;
+                }
+                safe_strcpy(ifname, sizeof_ifname, rtInfo->ifName);
+            }
+        }
+    }
 
     return 0;
 }

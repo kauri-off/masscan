@@ -329,6 +329,28 @@ rawsock_send_packet(
         return 0;
     }
 
+    /* RAW SOCKET (used for LINUX_SLL interfaces where pcap can't send) */
+#if defined(__linux__) || defined(__ANDROID__)
+    if (adapter->rawsock_fd >= 0) {
+        struct sockaddr_in dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        /* IP destination is at byte offset 16 in the IP header */
+        if (length >= 20) {
+            int err;
+            memcpy(&dst.sin_addr, packet + 16, 4);
+            err = (int)sendto(adapter->rawsock_fd, packet, length, 0,
+                              (struct sockaddr *)&dst, sizeof(dst));
+            if (err < 0)
+                LOG(1, "[-] rawsock: sendto failed: %s\n", strerror(errno));
+            else
+                LOG(3, "[+] rawsock: sent %d bytes\n", err);
+            return err;
+        }
+        return 0;
+    }
+#endif
+
     /* LIBPCAP */
     if (adapter->pcap)
         return PCAP.sendpacket(adapter->pcap, packet, length);
@@ -538,6 +560,12 @@ rawsock_close_adapter(struct Adapter *adapter)
     if (adapter->sendq) {
         PCAP.sendqueue_destroy(adapter->sendq);
     }
+#if defined(__linux__) || defined(__ANDROID__)
+    if (adapter->rawsock_fd >= 0) {
+        close(adapter->rawsock_fd);
+        adapter->rawsock_fd = -1;
+    }
+#endif
 
     free(adapter);
 }
@@ -609,6 +637,7 @@ rawsock_init_adapter(const char *adapter_name,
     adapter = CALLOC(1, sizeof(*adapter));
     adapter->is_packet_trace = is_packet_trace;
     adapter->pt_start = 1.0 * pixie_gettime() / 1000000.0;
+    adapter->rawsock_fd = -1;
 
     adapter->is_vlan = is_vlan;
     adapter->vlan_id = vlan_id;
@@ -802,6 +831,31 @@ rawsock_init_adapter(const char *adapter_name,
                 break;
             case 1: /* Ethernet */
             case 12: /* IP Raw */
+                break;
+            case 113: /* Linux cooked (SLL) - e.g. Android rmnet */
+                /* pcap_sendpacket is not supported on cooked sockets.
+                 * Open a raw AF_INET socket for sending instead. */
+#if defined(__linux__) || defined(__ANDROID__)
+                {
+                    int one = 1;
+                    adapter->rawsock_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+                    if (adapter->rawsock_fd < 0) {
+                        LOG(0, "[-] if(%s): socket(AF_INET, SOCK_RAW): %s\n",
+                                adapter_name, strerror(errno));
+                    } else if (setsockopt(adapter->rawsock_fd, IPPROTO_IP,
+                                          IP_HDRINCL, &one, sizeof(one)) < 0) {
+                        LOG(0, "[-] if(%s): setsockopt(IP_HDRINCL): %s\n",
+                                adapter_name, strerror(errno));
+                    } else if (setsockopt(adapter->rawsock_fd, SOL_SOCKET,
+                                          SO_BINDTODEVICE,
+                                          adapter_name, strlen(adapter_name)) < 0) {
+                        LOG(0, "[-] if(%s): setsockopt(SO_BINDTODEVICE): %s\n",
+                                adapter_name, strerror(errno));
+                    } else {
+                        LOG(1, "[+] if(%s): using raw socket for TX\n", adapter_name);
+                    }
+                }
+#endif
                 break;
             default:
                 LOG(0, "[-] if(%s): unknown data link type: %u(%s)\n",

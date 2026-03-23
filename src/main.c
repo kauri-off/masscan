@@ -799,14 +799,18 @@ receive_thread(void *v)
         if (length > 1514)
             continue;
 
+        LOG(2, "[+] recv: got packet len=%u link=%d\n", length, data_link);
+
         /*
          * "Preprocess" the response packet. This means to go through and
          * figure out where the TCP/IP headers are and the locations of
          * some fields, like IP address and port numbers.
          */
         x = preprocess_frame(px, length, data_link, &parsed);
-        if (!x)
+        if (!x) {
+            LOG(1, "[-] recv: preprocess_frame failed, len=%u link=%d\n", length, data_link);
             continue; /* corrupt packet */
+        }
         ip_me = parsed.dst_ip;
         ip_them = parsed.src_ip;
         port_me = parsed.port_dst;

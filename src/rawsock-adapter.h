@@ -11,6 +11,9 @@ struct Adapter
     unsigned vlan_id;
     double pt_start;
     int link_type;
+    /* Raw socket used for sending on LINUX_SLL (cooked) interfaces where
+     * pcap_sendpacket is not supported (e.g. Android rmnet). -1 if unused. */
+    int rawsock_fd;
 };
 
 
